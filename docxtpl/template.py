@@ -17,6 +17,8 @@ import docx.oxml.ns
 from docx.opc.constants import RELATIONSHIP_TYPE as REL_TYPE
 from jinja2 import Environment, Template, meta
 from jinja2.exceptions import TemplateError
+import re
+import xml.etree.ElementTree as ET
 
 try:
     from html import escape  # noqa: F401
@@ -49,6 +51,9 @@ class DocxTemplate(object):
         self.is_rendered = False
         self.is_saved = False
         self.allow_missing_pics = False
+        self.last_context = None
+        self.render_chart_data = False
+        self.last_context_jinja_env = None
 
     def init_docx(self, reload: bool = True):
         if not self.docx or (self.is_rendered and reload):
@@ -61,6 +66,9 @@ class DocxTemplate(object):
         self.current_rendering_part = None
         self.docx_ids_index = 1000
         self.is_saved = False
+        self.last_context = None
+        self.render_chart_data = False
+        self.last_context_jinja_env = None
 
     def __getattr__(self, name):
         return getattr(self.docx, name)
@@ -474,9 +482,15 @@ class DocxTemplate(object):
         context: Dict[str, Any],
         jinja_env: Optional[Environment] = None,
         autoescape: bool = False,
+        render_chart_data: bool = False,
     ) -> None:
         # init template working attributes
         self.render_init()
+        
+        # rendering of charts
+        self.render_chart_data = render_chart_data
+        self.last_context = context
+        self.last_context_jinja_env = jinja_env
 
         if autoescape:
             if not jinja_env:
@@ -745,8 +759,76 @@ class DocxTemplate(object):
         self.zipname_to_replace = {}
         self.pics_to_replace = {}
 
+    def render_chart_data(self, buffer: bytes, jinja_env: Environment = None):
+        # XLSX ist selbst ein ZIP-Archiv - wir müssen es modifizieren
+        modified_xlsx = io.BytesIO()
+        if jinja_env is None:
+            jinja_env = Environment()
+        with zipfile.ZipFile(io.BytesIO(buffer)) as zin2:
+            # Erste Phase: sharedStrings.xml verarbeiten und numerische Indizes sammeln
+            numeric_indices = {}  # {index: numeric_value}
+            rendered_shared_strings = None
+            
+            for xlsx_item in zin2.infolist():
+                if xlsx_item.filename == "xl/sharedStrings.xml":
+                    xlsx_data = zin2.read(xlsx_item.filename)
+                    template = jinja_env.from_string(xlsx_data.decode('utf-8'))
+                    rendered = template.render(self.last_context)
+                    rendered_shared_strings = rendered
+                    
+                    # Parse XML und finde numerische Strings
+                    try:
+                        # remove namespace
+                        xml_string = re.sub('xmlns="[^"]+"', '', rendered, count=1)
+                        root = ET.fromstring(xml_string.encode('utf-8'))
+                        si_elements = root.findall('si')
+                        
+                        for idx, si in enumerate(si_elements):
+                            t_elem = si.find('t')
+                            
+                            if t_elem is not None and t_elem.text:
+                                text = t_elem.text.strip()
+                                # Prüfe ob es numerisch ist
+                                try:
+                                    numeric_value = float(text)
+                                    # Prüfe ob es eine ganze Zahl ist
+                                    if numeric_value.is_integer():
+                                        numeric_indices[idx] = str(int(numeric_value))
+                                    else:
+                                        numeric_indices[idx] = str(numeric_value)
+                                except ValueError:
+                                    # Nicht numerisch, überspringen
+                                    pass
+                    except Exception as e:
+                        # Bei Fehler einfach keine numerischen Konvertierungen durchführen
+                        pass
+                    break
+            
+            # Zweite Phase: Alle Dateien schreiben und Worksheets anpassen
+            with zipfile.ZipFile(modified_xlsx, 'w', zipfile.ZIP_DEFLATED) as zout_xlsx:
+                for xlsx_item in zin2.infolist():
+                    xlsx_data = zin2.read(xlsx_item.filename)
+                    
+                    if xlsx_item.filename == "xl/sharedStrings.xml":
+                        # Bereits gerenderte Version verwenden
+                        xlsx_data = rendered_shared_strings.encode('utf-8')
+                    elif xlsx_item.filename.startswith("xl/worksheets/") and xlsx_item.filename.endswith(".xml"):
+                        # Worksheet anpassen: String-Referenzen zu numerischen Werten konvertieren
+                        worksheet_str = xlsx_data.decode('utf-8')
+                        for idx, numeric_value in numeric_indices.items():
+                            # Pattern für String-Zellen mit diesem Index
+                            pattern = r'(<c[^>]*\s)t="s"(><v>)' + str(idx) + r'(</v></c>)'
+                            replacement = r'\g<1>t="n"\g<2>' + str(numeric_value) + r'\g<3>'
+                            worksheet_str = re.sub(pattern, replacement, worksheet_str)
+                        xlsx_data = worksheet_str.encode('utf-8')
+                    
+                    zout_xlsx.writestr(xlsx_item, xlsx_data)
+        
+        # Modifiziertes XLSX in das Hauptdokument schreiben
+        return modified_xlsx.getvalue()
+
     def post_processing(self, docx_file):
-        if self.crc_to_new_media or self.crc_to_new_embedded or self.zipname_to_replace:
+        if self.crc_to_new_media or self.crc_to_new_embedded or self.zipname_to_replace or self.render_chart_data:
 
             if hasattr(docx_file, "read"):
                 tmp_file = io.BytesIO()
@@ -777,7 +859,10 @@ class DocxTemplate(object):
                         ):
                             zout.writestr(item, self.crc_to_new_embedded[item.CRC])
                         else:
-                            zout.writestr(item, buf)
+                            if self.render_chart_data and item.filename.startswith("word/embeddings/") and item.filename.endswith(".xlsx"):
+                                zout.writestr(item, self.render_chart_data(buf))
+                            else:
+                                zout.writestr(item, buf)
 
             if not hasattr(tmp_file, "read"):
                 os.remove(tmp_file)
